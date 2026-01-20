@@ -5,7 +5,7 @@ import numpy as np
 from keras import ops
 
 from bayesflow.types import Tensor
-from bayesflow.utils import expand_right_as, integrate, integrate_stochastic, STOCHASTIC_METHODS
+from bayesflow.utils import expand_right_as, integrate, integrate_stochastic, STOCHASTIC_METHODS, logging
 from bayesflow.utils.serialization import serializable
 from .diffusion_model import DiffusionModel
 from .schedules.noise_schedule import NoiseSchedule
@@ -104,6 +104,18 @@ class CompositionalDiffusionModel(DiffusionModel):
             integrate_kwargs=integrate_kwargs,
             **kwargs,
         )
+        self.compositional_bridge_d0 = self.add_variable(
+            shape=(),
+            initializer=keras.initializers.Constant(1.0),
+            trainable=False,
+            name="compositional_bridge_d0",
+        )
+        self.compositional_bridge_d1 = self.add_variable(
+            shape=(),
+            initializer=keras.initializers.Constant(1.0),
+            trainable=False,
+            name="compositional_bridge_d1",
+        )
 
     def compositional_bridge(self, time: Tensor) -> Tensor:
         """
@@ -121,7 +133,9 @@ class CompositionalDiffusionModel(DiffusionModel):
             Bridge function value with same shape as time.
 
         """
-        return ops.exp(-np.log(self.compositional_bridge_d0 / self.compositional_bridge_d1) * time)
+        d0 = ops.cast(self.compositional_bridge_d0, dtype=ops.dtype(time))
+        d1 = ops.cast(self.compositional_bridge_d1, dtype=ops.dtype(time))
+        return ops.exp(-ops.log(d0 / d1) * time)
 
     def compositional_velocity(
         self,
@@ -312,8 +326,18 @@ class CompositionalDiffusionModel(DiffusionModel):
         if mini_batch_size is None:
             mini_batch_size = n_compositional
         mini_batch_size = max(mini_batch_size, 1)
-        self.compositional_bridge_d0 = float(integrate_kwargs.pop("compositional_bridge_d0", 1.0))
-        self.compositional_bridge_d1 = float(integrate_kwargs.pop("compositional_bridge_d1", 1 / n_compositional))
+
+        if keras.backend.backend() == "jax" and mini_batch_size < n_compositional:
+            logging.warning(
+                "Dynamic mini-batch shuffling is not supported for JAX backend during integration. "
+                "Shuffling once at the beginning of sampling."
+            )
+            indices = keras.random.shuffle(ops.arange(n_compositional), seed=self.seed_generator)
+            conditions = ops.take(conditions, indices[:mini_batch_size], axis=1)
+            mini_batch_size = None
+
+        self.compositional_bridge_d0.assign(float(integrate_kwargs.pop("compositional_bridge_d0", 1.0)))
+        self.compositional_bridge_d1.assign(float(integrate_kwargs.pop("compositional_bridge_d1", 1 / n_compositional)))
 
         # x is sampled from a normal distribution, must be scaled with var 1/n_compositional
         scale_latent = n_compositional * self.compositional_bridge(ops.ones(1))
